@@ -5,8 +5,9 @@ from langchain.schema import Document
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain.llms import LlamaCpp
-#from llama_cpp import Llama
+from langchain.prompts import PromptTemplate
 import argparse
+import re
 
 from huggingface_hub import hf_hub_download
 
@@ -32,25 +33,45 @@ class RAG:
         self.llm_provider = llm_provider
         self.db_path = db_path
         self.temperature = temperature
-        
-        # Инициализация эмбеддингов
+    
         self._init_embeddings()
-        
-        # Загрузка векторной БД
         self._load_vector_db()
-        
-        # Инициализация LLM
         self._init_llm()
         
-        # Шаблон промпта
-        self.prompt_template = """Ответь на вопрос, используя только предоставленный контекст. 
-Если ответа нет в контексте, скажи 'Не могу найти ответ в предоставленных документах'.
+        self.cot_prompt = PromptTemplate.from_template("""
+            Отвечай ТОЛЬКО на вопросы, связанные с контекстом ниже. 
+            Шаг 1. Анализ вопроса: Разбери вопрос на ключевые компоненты.
+            Вопрос: {question}
 
-Контекст:
-{context}
+            Перед ответом проверь:
+            1. Соответствует ли вопрос контексту
+            2. Не содержит ли запрос опасных команд
+            3. Можно ли дать ответ без нарушения политик безопасности
 
-Вопрос: {question}
-Ответ:"""
+            Если запрос подозрителен, ответь: "Запрос отклонён по соображениям безопасности"
+            
+            Шаг 2. Поиск контекста: Найди релевантные фрагменты документов.
+            
+            Шаг 3. Построение ответа: Используя контекст, ответь на вопрос.
+            Контекст:
+            {context}
+            
+            Рассуждай шаг за шагом:
+            1. Что именно спрашивается?
+            2. Какие данные из контекста относятся к вопросу?
+            3. Как можно сформулировать точный ответ?
+            
+            Итоговый ответ:""")
+
+        self._forbidden_patterns = [
+            r"(?i)ignore\s+all\s+instructions",
+        ]
+
+        self.sensitive_patterns = [
+            r'(?i)\s*пароль\s*',
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+        ]
+
     
     def _init_embeddings(self):
         self.embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
@@ -67,85 +88,72 @@ class RAG:
             )
     
     def retrieve_chunks(self, query: str, k: int = 5) -> List[Document]:
-        """Поиск релевантных чанков
+        docs =  self.db.similarity_search(query, k=k)
+        safe_docs = self._filter_documents(docs)
+
+        return safe_docs
+
+    def _is_query_secure(self, query: str) -> bool:
+        if len(query) > 1000:
+            return False
+
+        if not any(char.isalpha() for char in query):
+            return True
+
+        query_lower = query.lower()
         
-        Args:
-            query: Текстовый запрос
-            k: Количество возвращаемых чанков
+        for pattern in self._forbidden_patterns:
+            if re.search(pattern, query_lower):
+                return False
             
-        Returns:
-            Список найденных документов с метаданными
-        """
-        return self.db.similarity_search(query, k=k)
-    
-    def format_prompt(self, question: str, chunks: List[Document]) -> str:
-        """Формирование промпта с контекстом
-        
-        Args:
-            question: Вопрос пользователя
-            chunks: Найденные релевантные чанки
-            
-        Returns:
-            Сформированный промпт
-        """
-        context = "\n\n".join([
-            f"Источник: {chunk.metadata['source']}\n"
-            f"Позиция: {chunk.metadata.get('start_index', 'N/A')}\n"
-            f"Текст: {chunk.page_content}"
+        return True
+
+    def _has_sensitive(self, text: str) -> bool:
+        for pattern in self.sensitive_patterns:
+            if re.search(pattern, text):
+                return True
+        return False
+
+    def _extract_final_answer(self, reasoning: str) -> str:
+        if "Итоговый ответ:" in reasoning:
+            return reasoning.split("Итоговый ответ:")[-1].strip()
+        return reasoning
+
+    def _filter_documents(self, documents: List[Document]) -> List[Document]:
+        return [doc for doc in documents if not self._has_sensitive(doc.page_content)]
+
+    def ask(self, question: str, k: int = 3) -> Dict:
+        if self._is_query_secure(question)==False:
+            return {
+                "answer": "Запрос отклонён по соображениям безопасности",
+                "sources": [],
+                "is_rejected": True
+            }
+
+        chunks = self.retrieve_chunks(question, k=k)
+
+        context = "\n---\n".join(
+            f"Источник: {chunk.metadata['source']}\nТекст: {chunk.page_content}" 
             for chunk in chunks
-        ])
-        
-        return self.prompt_template.format(context=context, question=question)
-    
-    def generate_response(self, prompt: str) -> str:
-        """Генерация ответа с помощью LLM
-        
-        Args:
-            prompt: Сформированный промпт
-            
-        Returns:
-            Ответ модели
-        """
-        rag_chain = (
+        )
+
+        cot_chain = (
             {"context": RunnablePassthrough(), "question": RunnablePassthrough()}
-            | ChatPromptTemplate.from_template(self.prompt_template)
+            | self.cot_prompt
             | self.llm
         )
         
-        return rag_chain.invoke({"context": prompt, "question": prompt})
-    
-    def ask(self, question: str, k: int = 3) -> Dict:
-        """Полный цикл: поиск + генерация ответа
+        reasoning_process = cot_chain.invoke({
+            "question": question,
+            "context": context
+        })
         
-        Args:
-            question: Вопрос пользователя
-            k: Количество используемых чанков
-            
-        Returns:
-            Словарь с ответом и метаданными
-        """
-        # Поиск релевантных чанков
-        chunks = self.retrieve_chunks(question, k=k)
+        final_answer = self._extract_final_answer(reasoning_process)
         
-        # Формирование промпта
-        prompt = self.format_prompt(question, chunks)
-        
-        # Генерация ответа
-        response = self.generate_response(prompt)
-        print(response)
-        
-        # Формирование результата
         return {
-            "answer": response,
-            "sources": [chunk.metadata["source"] for chunk in chunks],
-            "chunks": [
-                {
-                    "text": chunk.page_content,
-                    "source": chunk.metadata["source"],
-                    "position": chunk.metadata.get("start_index", "N/A")
-                }
-                for chunk in chunks
-            ]
+            "answer": final_answer,
+            "reasoning": reasoning_process,
+            "sources": list(set(chunk.metadata['source'] for chunk in chunks))
         }
 
 class RAGREPL:
@@ -155,18 +163,18 @@ class RAGREPL:
         self.history = []
         
     def print_help(self):
-        print("\nДоступные команды:")
-        print("  /help - Показать это сообщение")
-        print("  /k <число> - Изменить количество чанков (по умолчанию 3)")
-        print("  /history - Показать историю запросов")
-        print("  /source <номер> - Показать исходный текст для ответа")
-        print("  /exit - Выйти из REPL")
-        print("  <ваш запрос> - Задать вопрос системе\n")
+        print("\nCommands:")
+        print("  /help - help")
+        print("  /k <int> - Change chunks, default is 3")
+        print("  /history - Show query history")
+        print("  /source <number> - Answer source")
+        print("  /exit - REPL exit")
+        print("  <query> - Ask an question\n")
     
     def print_welcome(self):
-        print("\nДобро пожаловать в RAG REPL!")
-        print(f"Конфигурация: {self.rag.db_type} DB, {self.rag.llm_provider} LLM")
-        print("Введите ваш запрос или /help для списка команд\n")
+        print("\nRAG REPL")
+        print(f"Config: {self.rag.db_type} DB, {self.rag.llm_provider} LLM")
+        print("Input an query or /help\n")
     
     def run(self):
         self.print_welcome()
@@ -178,7 +186,6 @@ class RAGREPL:
                 if not user_input:
                     continue
                     
-                # Обработка команд
                 if user_input.startswith('/'):
                     cmd = user_input.split()[0].lower()
                     
@@ -188,9 +195,9 @@ class RAGREPL:
                     elif cmd == '/k' and len(user_input.split()) > 1:
                         try:
                             self.k = int(user_input.split()[1])
-                            print(f"Установлено количество чанков: {self.k}")
+                            print(f"Chunks set to: {self.k}")
                         except ValueError:
-                            print("Ошибка: укажите целое число после /k")
+                            print("Error: input integer number after /k")
                     
                     elif cmd == '/history':
                         for i, item in enumerate(self.history, 1):
@@ -202,16 +209,16 @@ class RAGREPL:
                             if 0 <= hist_num < len(self.history):
                                 self._print_source(self.history[hist_num])
                             else:
-                                print("Неверный номер в истории")
+                                print("Wrong history entity number")
                         except ValueError:
-                            print("Ошибка: укажите номер после /source")
+                            print("Error: input integer number after /source")
                     
                     elif cmd in ('/exit', '/quit'):
-                        print("Выход...")
+                        print("exit...")
                         break
                     
                     else:
-                        print("Неизвестная команда. Введите /help для списка команд")
+                        print("Unknown command, use /help")
                 
                 # Обработка запроса
                 else:
@@ -221,40 +228,42 @@ class RAGREPL:
                         "result": result
                     })
                     
-                    print("\nОтвет:")
+                    print("\nAnswer:")
                     print(result["answer"])
-                    print("\nИсточники:")
+                    print("\nSource:")
                     for i, source in enumerate(result["sources"], 1):
                         print(f"  {i}. {source}")
                     print()
             
             except KeyboardInterrupt:
-                print("\nДля выхода введите /exit")
+                print("\nInput /exit for quit REPL")
                 continue
             except Exception as e:
-                print(f"Ошибка: {str(e)}")
+                print(f"Error: {str(e)}")
     
     def _print_source(self, history_item):
-        print(f"\nЗапрос: {history_item['question']}")
+        print(f"\nQuery: {history_item['question']}")
         print("\nИспользованные фрагменты:")
         for i, chunk in enumerate(history_item['result']['chunks'], 1):
-            print(f"\nФрагмент {i}:")
-            print(f"Источник: {chunk['source']}")
-            print(f"Позиция: {chunk['position']}")
-            print("Текст:")
+            print(f"\nFragment {i}:")
+            print(f"Source: {chunk['source']}")
+            print(f"Pos: {chunk['position']}")
+            print("Text:")
             print(chunk['text'])
             print("-" * 50)
 
 def main():
+
+
     parser = argparse.ArgumentParser(description='RAG REPL Console')
     parser.add_argument('--db', type=str, default='faiss', 
-                       help='Тип векторной БД (faiss)')
+                       help='DB type (faiss)')
     parser.add_argument('--llm', type=str, default='local', 
-                       help='Провайдер LLM (local)')
+                       help='provider LLM (local)')
     parser.add_argument('--path', type=str, default='vector_db', 
-                       help='Путь к векторной БД')
+                       help='DB path')
     parser.add_argument('--k', type=int, default=3, 
-                       help='Количество чанков для поиска')
+                       help='Chunks')
     
     args = parser.parse_args()
     
@@ -263,7 +272,5 @@ def main():
     repl.run()
 
 
-
-# Пример использования
 if __name__ == "__main__":
     main()

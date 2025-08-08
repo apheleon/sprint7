@@ -1,19 +1,17 @@
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 import os
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-CHUNK_SIZE = 100
+CHUNK_SIZE = 200
 CHUNK_OVERLAP = 50
 DB_DIR = "vector_db"
 DB_TYPE = "faiss"
 DOCS_DIRECTORY = "knowledge_base/origin"
 
-# Инициализация модели для эмбеддингов
 embeddings = HuggingFaceEmbeddings(model_name=MODEL_NAME)
 
-# Инициализация сплиттера
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP,
