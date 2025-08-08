@@ -9,6 +9,8 @@ from langchain.prompts import PromptTemplate
 import argparse
 import re
 
+import db
+
 from huggingface_hub import hf_hub_download
 
 #model_path = hf_hub_download(
@@ -219,8 +221,6 @@ class RAGREPL:
                     
                     else:
                         print("Unknown command, use /help")
-                
-                # Обработка запроса
                 else:
                     result = self.rag.ask(user_input, k=self.k)
                     self.history.append({
@@ -243,7 +243,7 @@ class RAGREPL:
     
     def _print_source(self, history_item):
         print(f"\nQuery: {history_item['question']}")
-        print("\nИспользованные фрагменты:")
+        print("\nFragments:")
         for i, chunk in enumerate(history_item['result']['chunks'], 1):
             print(f"\nFragment {i}:")
             print(f"Source: {chunk['source']}")
@@ -253,7 +253,8 @@ class RAGREPL:
             print("-" * 50)
 
 def main():
-
+    dbMaker = db.DB()
+    dbMaker.create()
 
     parser = argparse.ArgumentParser(description='RAG REPL Console')
     parser.add_argument('--db', type=str, default='faiss', 

@@ -19,44 +19,48 @@ text_splitter = RecursiveCharacterTextSplitter(
     add_start_index=True,
 )
 
-def process_documents(directory_path):
-    documents = []
+class DB:
+    def __init__(self):
+        self.k = 1
+
+    def process_documents(self, directory_path):
+        documents = []
     
-    for root, _, files in os.walk(directory_path):
-        for file in files:
-            if file.endswith(('.txt')):
-                file_path = os.path.join(root, file)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        text = f.read()
+        for root, _, files in os.walk(directory_path):
+            for file in files:
+                if file.endswith(('.txt')):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            text = f.read()
                     
-                    metadata = {
-                        "source": file_path,
-                        "title": os.path.splitext(file)[0]
-                    }
+                        metadata = {
+                            "source": file_path,
+                            "title": os.path.splitext(file)[0]
+                        }
                     
-                    chunks = text_splitter.create_documents([text], [metadata])
+                        chunks = text_splitter.create_documents([text], [metadata])
                     
-                    for i, chunk in enumerate(chunks):
-                        chunk.metadata["chunk_id"] = i
-                        chunk.metadata["start_index"] = chunk.metadata.get("start_index", 0)
+                        for i, chunk in enumerate(chunks):
+                            chunk.metadata["chunk_id"] = i
+                            chunk.metadata["start_index"] = chunk.metadata.get("start_index", 0)
                     
-                    documents.extend(chunks)
+                        documents.extend(chunks)
                 
-                except Exception as e:
-                    print(f"Error processing file {file_path}: {e}")
+                    except Exception as e:
+                        print(f"Error processing file {file_path}: {e}")
     
-    return documents
+        return documents
+    
+    def create_vector_db(self, documents):
 
-def create_vector_db(documents):
-    db = FAISS.from_documents(documents, embeddings)
-    db.save_local(DB_DIR)
-    
-    return db
+        db = FAISS.from_documents(documents, embeddings)
+        db.save_local(DB_DIR)
 
+    def create(self):
+        documents =  self.process_documents(DOCS_DIRECTORY)
+        print(f"Created {len(documents)} chunks")
     
-documents = process_documents(DOCS_DIRECTORY)
-print(f"Created {len(documents)} chunks")
-    
-db = create_vector_db(documents)
-print(f"DB created in  {DB_DIR}")
+        self.create_vector_db(documents)
+        print(f"DB created in  {DB_DIR}")
+
